@@ -99,6 +99,15 @@ def norm_scene(scene: Scene) -> Scene:
         geom.vertices *= (1 - 1e-3)
     return scene
 
+def vertex_to_face_colors(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    if isinstance(mesh.visual, trimesh.visual.TextureVisuals):
+        vertex_colors = mesh.visual.to_color()
+        face_colors = trimesh.visual.color.vertex_to_face_color(vertex_colors.vertex_colors, mesh.faces)
+        color_visuals = trimesh.visual.ColorVisuals(face_colors=face_colors)
+        mesh.visual = color_visuals
+
+    return mesh
+
 
 if __name__ == "__main__":
     from samesh.data.loaders import read_mesh

@@ -26,11 +26,87 @@ from samesh.utils.mesh import duplicate_verts
 from samesh.models.shape_diameter_function import *
 
 
-def colormap_faces_mesh(mesh: Trimesh, face2label: dict[int, int], background=np.array([0, 0, 0])) -> Trimesh:
+def generate_high_contrast_palette(n_colors, seed=0):
     """
+    Generate a palette of maximally distinct colors using HSV color space.
+    
+    Args:
+        n_colors: Number of colors to generate
+        seed: Random seed for reproducibility
+        
+    Returns:
+        np.ndarray: Array of RGB colors (n_colors x 3) with values in [0, 255]
+    """
+    import colorsys
+    
+    # Start with a base set of highly distinctive colors
+    base_colors = [
+        [255, 0, 0],      # Red
+        [0, 255, 0],      # Green
+        [0, 0, 255],      # Blue
+        [255, 255, 0],    # Yellow
+        [255, 0, 255],    # Magenta
+        [0, 255, 255],    # Cyan
+        [255, 128, 0],    # Orange
+        [128, 0, 255],    # Purple
+        [0, 255, 128],    # Spring Green
+        [255, 0, 128],    # Rose
+        [128, 255, 0],    # Chartreuse
+        [0, 128, 255],    # Azure
+        [255, 165, 0],    # Dark Orange
+        [148, 0, 211],    # Dark Violet
+        [50, 205, 50],    # Lime Green
+        [220, 20, 60],    # Crimson
+        [64, 224, 208],   # Turquoise
+        [255, 215, 0],    # Gold
+        [186, 85, 211],   # Medium Orchid
+        [34, 139, 34],    # Forest Green
+    ]
+    
+    if n_colors <= len(base_colors):
+        return np.array(base_colors[:n_colors], dtype=np.uint8)
+    
+    # If we need more colors, generate them using HSV with maximum saturation and value
+    colors = base_colors.copy()
+    np.random.seed(seed)
+    
+    # Generate additional colors by spacing them evenly in HSV hue space
+    n_additional = n_colors - len(base_colors)
+    for i in range(n_additional):
+        # Use golden ratio to space hues for maximum distinction
+        hue = (i * 0.618033988749895) % 1.0
+        # Vary saturation and value slightly for more variety
+        sat = 0.8 + 0.2 * np.random.random()
+        val = 0.8 + 0.2 * np.random.random()
+        
+        rgb = colorsys.hsv_to_rgb(hue, sat, val)
+        colors.append([int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)])
+    
+    return np.array(colors[:n_colors], dtype=np.uint8)
+
+
+def colormap_faces_mesh(mesh: Trimesh, face2label: dict[int, int], background=np.array([0, 0, 0]), high_contrast=False) -> Trimesh:
+    """
+    Color mesh faces according to their labels.
+    
+    Args:
+        mesh: Input mesh
+        face2label: Dictionary mapping face indices to label indices
+        background: Background color for label 0
+        high_contrast: If True, use high-contrast color palette. If False, use random colors.
+    
+    Returns:
+        Mesh with colored faces
     """
     label_max = max(face2label.values())
-    palette = RandomState(0).randint(0, 255, (label_max + 1, 3)) # +1 for unlabeled faces
+    
+    if high_contrast:
+        # Use high-contrast palette
+        palette = generate_high_contrast_palette(label_max + 1, seed=0)
+    else:
+        # Use original random palette
+        palette = RandomState(0).randint(0, 255, (label_max + 1, 3))
+    
     palette[0] = background
     mesh = duplicate_verts(mesh) # needed to prevent face color interpolation
     faces_colored = set()
@@ -613,7 +689,7 @@ def segment_mesh(filename: Path | str, config: OmegaConf, visualize=False, exten
     filename = Path(filename)
     config = copy.deepcopy(config)
     config.cache  = Path(config.cache)  / filename.stem if "cache" in config else None
-    config.output = Path(config.output) / filename.stem
+    config.output = Path(config.output) / filename.stem 
 
     model = SamModelMesh(config)
     tmesh = read_mesh(filename, norm=True)
@@ -623,12 +699,20 @@ def segment_mesh(filename: Path | str, config: OmegaConf, visualize=False, exten
     # run sam grounded mesh and optionally visualize renders
     visualize_path = f'{config.output}/{filename.stem}_visualized' if visualize else None
     faces2label, _ = model(tmesh, visualize_path=visualize_path, target_labels=target_labels)
+    # Multiple faces can have the same label, so we need to split the mesh into parts
+    labels = set(faces2label.values())
+    for label in tqdm(labels, desc='Splitting mesh into parts'):
+        faces = [int(face) for face, label_ in faces2label.items() if label_ == label]
+        tmp_mesh = tmesh.copy()
+        tmp_mesh.update_faces(faces)
+        tmp_mesh.remove_unreferenced_vertices()
+        tmp_mesh.export(f'{config.output}/{filename.stem}_part_{label}.glb')
 
     # colormap and save mesh
     os.makedirs(config.output, exist_ok=True)
     tmesh_colored = colormap_faces_mesh(tmesh, faces2label)
-    tmesh_colored.export       (f'{config.output}/{filename.stem}_segmented.{extension}')
-    json.dump(faces2label, open(f'{config.output}/{filename.stem}_face2label.json', 'w'))
+    tmesh_colored.export(f'{config.output}/{filename.stem}_segmented.{extension}')
+    json.dump(faces2label, open(f'{config.output}/face2label.json', 'w'))
     return tmesh_colored
 
 

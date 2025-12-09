@@ -1,0 +1,58 @@
+---
+cache: /home/nranawakaara/Projects/samesh/outputs/mesh_segmentation_cache
+cache_overwrite: True
+output: /home/nranawakaara/Projects/samesh/cdc_results_dodecahedron_advanced/
+target_labels: null
+
+vlm:
+  gemini:
+    project: real2sim-473122
+    model: gemini-3-pro-preview
+
+sam:
+  sam:
+    checkpoint: /home/nranawakaara/Projects/samesh/third_party/segment-anything-2/checkpoints/sam2_hiera_large.pt
+    model_config: sam2_hiera_l.yaml
+    auto: True
+    ground: False
+    engine_config:
+      points_per_side: 36
+      crop_n_layers: 0
+      #min_mask_region_area: 1024 # sam2 breaks since it uses C connected components
+      pred_iou_thresh: 0.5
+      stability_score_thresh: 0.7
+      stability_score_offset: 1.0
+
+sam_mesh:
+  use_modes: ['sdf', 'norms']
+  min_area: 2048
+  connections_bin_resolution: 100
+  connections_bin_threshold_percentage: 0.125 
+  smoothing_threshold_percentage_size: 0.025
+  smoothing_threshold_percentage_area: 0.025
+  smoothing_iterations: 64
+  # repartition_cost: 1
+  # repartition_lambda: 6
+  # repartition_iterations: 1
+  # connections_threshold: 0
+
+  # CDC values  
+  repartition_cost: 1
+  repartition_lambda: 7
+  repartition_lambda_lb: 1
+  repartition_lambda_ub: 15
+  repartition_lambda_tolerance: 1
+  repartition_iterations: 2
+  connections_threshold: 0
+
+renderer:
+  target_dim: [2048, 2048]  # Higher resolution for better quality
+  camera_generation_method: dodecahedron #octohedron
+  renderer_args:
+    interpolate_norms: True
+    uv_map: True  # Use original textures
+  sampling_args: {radius: 2.5}
+  bg_color: [0.95, 0.95, 0.95]  # Light gray background
+  smooth: False  # Enable smooth shading
+  lighting_args: {alpha: 0.3, beta: 0.5, ambient_light: [1.0, 1.0, 1.0]}  # Better lighting balance
+  onscreen: True

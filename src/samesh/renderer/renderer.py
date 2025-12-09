@@ -1,11 +1,13 @@
 import os
 os.environ['PYOPENGL_PLATFORM'] = 'egl'
 os.environ['EGL_DEVICE_ID'] = '-1' # NOTE: necessary to not create GPU contention
+from pygltflib import GLTF2
 
 ### START VOODOO ###
-# Dark encantation for disabling anti-aliasing in pyrender (if needed)
+# Enable anti-aliasing for better quality
 import OpenGL.GL
-antialias_active = False
+antialias_active = True  # Changed to True for better quality
+antialias_active = False   # Changed to True for better quality
 old_gl_enable = OpenGL.GL.glEnable
 def new_gl_enable(value):
     if not antialias_active and value == OpenGL.GL.GL_MULTISAMPLE:
@@ -19,11 +21,13 @@ import pyrender
 import cv2
 import numpy as np
 import torch
+import time
 from numpy.random import RandomState
 from PIL import Image
 from pyrender.shader_program import ShaderProgramCache as DefaultShaderCache
 from trimesh import Trimesh, Scene
 from omegaconf import OmegaConf
+from omegaconf.listconfig import ListConfig
 from tqdm import tqdm
 
 from samesh.data.common import NumpyTensor
@@ -54,9 +58,16 @@ def colormap_norms(norms: NumpyTensor['h w'], background=np.array([255, 255, 255
     norms = (norms * 255).astype(np.uint8)
     return Image.fromarray(norms)
 
+def create_default_metallic_material():
+    return pyrender.MetallicRoughnessMaterial(
+        baseColorFactor=[0.8, 0.8, 0.8, 1.0],
+        metallicFactor=0.0,      # Non-metallic default
+        roughnessFactor=0.5,     # Medium roughness 
+    )
 
-DEFAULT_CAMERA_PARAMS = {'fov': 60, 'znear': 0.01, 'zfar': 16}
-
+DEFAULT_CAMERA_PARAMS = {'fov': 60, 'znear': 0.1, 'zfar': 10}  # Tighter near/far for better depth precision
+# Dark encantation for disabling anti-aliasing in pyrender (if needed)
+# DEFAULT_CAMERA_PARAMS = {'fov': 60, 'znear': 0.01, 'zfar': 16} # Original values
 
 class Renderer:
     """
@@ -65,7 +76,11 @@ class Renderer:
         """
         """
         self.config = config
-        self.renderer = pyrender.OffscreenRenderer(*config.target_dim)
+        self.renderer = pyrender.OffscreenRenderer(
+            viewport_width=config.target_dim[0],
+            viewport_height=config.target_dim[1],
+            point_size=1.0
+        )
         self.shaders = {
             'default': DefaultShaderCache(),
             'normals': NormalShaderCache(),
@@ -78,18 +93,30 @@ class Renderer:
         """
         if isinstance(source, Scene):
             self.tmesh = scene2mesh(source)
-            self.scene = pyrender.Scene(ambient_light=[1.0, 1.0, 1.0]) # RGB no direction
+            ambient_light = self.config.lighting_args.get('ambient_light', [1.0, 1.0, 1.0])
+            bg_color = self.config.get('bg_color', [1.0, 1.0, 1.0])
+            if isinstance(ambient_light, ListConfig):
+                ambient_light = list(ambient_light)
+            if isinstance(bg_color, ListConfig):
+                bg_color = list(bg_color)
+            self.scene = pyrender.Scene(ambient_light=ambient_light, bg_color=bg_color) # RGB no direction
             for name, geom in source.geometry.items():
                 if name in source.graph:
                     pose, _ = source.graph[name]
                 else:
                     pose = None
-                self.scene.add(pyrender.Mesh.from_trimesh(geom, smooth=smooth), pose=pose)
+                self.scene.add(pyrender.Mesh.from_trimesh(geom, smooth=self.config.smooth), pose=pose)
         
         elif isinstance(source, Trimesh):
             self.tmesh = source
-            self.scene = pyrender.Scene(ambient_light=[1.0, 1.0, 1.0])
-            self.scene.add(pyrender.Mesh.from_trimesh(source, smooth=smooth))
+            ambient_light = self.config.lighting_args.get('ambient_light', [1.0, 1.0, 1.0])
+            bg_color = self.config.get('bg_color', [1.0, 1.0, 1.0])
+            if isinstance(ambient_light, ListConfig):
+                ambient_light = list(ambient_light)
+            if isinstance(bg_color, ListConfig):
+                bg_color = list(bg_color)
+            self.scene = pyrender.Scene(ambient_light=ambient_light, bg_color=bg_color)
+            self.scene.add(pyrender.Mesh.from_trimesh(source, smooth=self.config.smooth))
 
         else:
             raise ValueError(f'Invalid source type {type(source)}')
@@ -98,8 +125,42 @@ class Renderer:
         self.tmesh_faceid = duplicate_verts(self.tmesh)
         self.scene_faceid = pyrender.Scene(ambient_light=[1.0, 1.0, 1.0])
         self.scene_faceid.add(
-            pyrender.Mesh.from_trimesh(self.tmesh_faceid, smooth=smooth)
+            pyrender.Mesh.from_trimesh(self.tmesh_faceid, smooth=self.config.smooth)
         )
+
+        # Add directional lights for better illumination
+        direc_l1 = pyrender.DirectionalLight(color=np.ones(3), intensity=3.0)
+        direc_l2 = pyrender.DirectionalLight(color=np.ones(3), intensity=2.0)
+        direc_l3 = pyrender.DirectionalLight(color=np.ones(3), intensity=2.0)
+        
+        # Position lights from multiple angles
+        self.scene.add(direc_l1, pose=np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 2],
+            [0, 0, 0, 1]
+        ]))
+        
+        self.scene.add(direc_l2, pose=np.array([
+            [1, 0, 0, -2],
+            [0, 1, 0, 2],
+            [0, 0, 1, 1],
+            [0, 0, 0, 1]
+        ]))
+        
+        self.scene.add(direc_l3, pose=np.array([
+            [1, 0, 0, 2],
+            [0, 1, 0, -1],
+            [0, 0, 1, 1],
+            [0, 0, 0, 1]
+        ]))
+
+        # if self.config.onscreen:
+        #     self.viewer = pyrender.Viewer(self.scene)
+
+        # while True:
+        #     time.sleep(0.01)
+        #     continue
 
     def set_camera(self, camera_params: dict = None):
         """
@@ -115,12 +176,14 @@ class Renderer:
     def render(
         self, 
         pose: HomogeneousTransform, 
-        lightdir=np.array([0.0, 0.0, 1.0]), uv_map=False, interpolate_norms=True, blur_matte=False
+        lightdir=np.array([0.0, 0.0, 1.0]), uv_map=False, interpolate_norms=True, blur_matte=False,
+        alpha=0.5, beta=0.25, **kwargs
     ) -> dict:
         """
         """
         self.scene       .set_pose(self.camera_node       , pose)
         self.scene_faceid.set_pose(self.camera_node_faceid, pose)
+
 
         def render(shader: str, scene):
             """
@@ -150,7 +213,12 @@ class Renderer:
             faces = faces.astype(np.int32)
             faces = faces[:, :, 0] * 65536 + faces[:, :, 1] * 256 + faces[:, :, 2]
             faces[faces == (256 ** 3 - 1)] = -1 # set background to -1
+
+            if np.any(faces >= self.tmesh_faceid.faces.shape[0]):
+                print(f'WARNING: Faces {np.unique(faces[faces >= self.tmesh_faceid.faces.shape[0]])} are out of range. Setting them to -1.')
+                faces[faces >= self.tmesh_faceid.faces.shape[0]] = -1
             return faces
+            
 
         def render_bcent(bcent: NumpyTensor['h w 3']) -> NumpyTensor['h w 3']:
             """
@@ -162,7 +230,7 @@ class Renderer:
             depth: NumpyTensor['h w'],
             faces: NumpyTensor['h w'],
             bcent: NumpyTensor['h w 3'],
-            alpha=0.5, beta=0.25, gaussian_kernel_width=5, gaussian_sigma=1,
+            gaussian_kernel_width=5, gaussian_sigma=1,
         ) -> NumpyTensor['h w 3']:
             """
             """
@@ -220,7 +288,7 @@ def render_multiview(
     if verbose:
         views = tqdm(views, 'Rendering Multiviews...')
     for pose in views:
-        outputs = renderer.render(pose, lightdir=compute_lightdir(pose), **renderer_args)
+        outputs = renderer.render(pose, lightdir=compute_lightdir(pose), **renderer_args, **lighting_args)
         outputs['matte'] = Image.fromarray(outputs['matte'])
         outputs['poses'] = pose
         renders.append(outputs)

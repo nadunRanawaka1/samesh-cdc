@@ -15,6 +15,7 @@ from trimesh.base import Trimesh, Scene
 from sklearn.mixture import GaussianMixture
 from tqdm import tqdm
 from omegaconf import OmegaConf
+import matplotlib.pyplot as plt
 
 from samesh.data.common import NumpyTensor
 from samesh.data.loaders import scene2mesh, read_mesh
@@ -164,7 +165,7 @@ def colormap_shape_diameter_function(mesh: Trimesh, sdf_values: NumpyTensor['f']
     """
     assert len(mesh.faces) == len(sdf_values)
     mesh = duplicate_verts(mesh) # needed to prevent face color interpolation
-    mesh.visual.face_colors = trimesh.visual.interpolate(sdf_values, color_map='jet')
+    mesh.visual.face_colors = trimesh.visual.interpolate(sdf_values, color_map=plt.get_cmap('jet'))
     return mesh
 
 
