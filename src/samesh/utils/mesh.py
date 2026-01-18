@@ -16,10 +16,14 @@ def duplicate_verts(mesh: Trimesh) -> Trimesh:
 
     NOTE: removes visuals for verticies, but preserves for faces.
     """
+    # Ensure we have face colors even when visuals are textured
+    mesh = vertex_to_face_colors(mesh)
+
     verts = mesh.vertices[mesh.faces.reshape(-1), :]
     faces = np.arange(0, verts.shape[0])
     faces = faces.reshape(-1, 3)
-    return Trimesh(vertices=verts, faces=faces, face_colors=mesh.visual.face_colors, process=False)
+    face_colors = mesh.visual.face_colors if hasattr(mesh.visual, "face_colors") else None
+    return Trimesh(vertices=verts, faces=faces, face_colors=face_colors, process=False)
 
 
 def handle_pose(pose: NumpyTensor['4 4']) -> NumpyTensor['4 4']:

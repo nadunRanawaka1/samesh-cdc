@@ -217,14 +217,23 @@ def compute_face2label(
     normal_mask = norms_mask(norms, pose)
 
     face2label = defaultdict(Counter)
-    for j, label in enumerate(labels):
+    for j, label in enumerate(tqdm(labels, desc=f'face2label (view {label_sequence_count})', leave=False)):
         label_sequence = label_sequence_count + j
         faces_mask = (mask == label) & normal_mask
         faces, counts = np.unique(faceid[faces_mask], return_counts=True)
-        faces = faces[counts > threshold_counts]
-        faces = faces[faces != -1] # remove background
-        for face in faces:
-            face2label[int(face)][label_sequence] += np.sum(faces_mask & (faceid == face))
+        
+        ## Old method of filtering faces   
+        # faces = faces[counts > threshold_counts]
+        # faces = faces[faces != -1] # remove background
+        # for face in faces:
+        #     face2label[int(face)][label_sequence] += np.sum(faces_mask & (faceid == face))
+        
+        # Filter faces and counts together (avoid recomputing counts in loop)
+        valid_mask = (counts > threshold_counts) & (faces != -1)
+        faces = faces[valid_mask]
+        counts = counts[valid_mask]
+        for face, count in zip(faces, counts):
+            face2label[int(face)][label_sequence] += count
     return face2label
 
 
@@ -246,6 +255,16 @@ def compute_connections(i: int, j: int, face2label1: dict, face2label2: dict, co
     for label1, counter in connections.items():
         connections[label1] = {k: v for k, v in counter.items() if v > counter_threshold}
     return connections
+
+
+def _compute_face2label_wrapper(args):
+    """Wrapper for imap (single-argument) compatibility."""
+    return compute_face2label(*args)
+
+
+def _compute_connections_wrapper(args):
+    """Wrapper for imap_unordered (single-argument) compatibility."""
+    return compute_connections(*args)
 
 
 class SamModelMesh(nn.Module):
@@ -380,7 +399,6 @@ class SamModelMesh(nn.Module):
         be, en = 0, len(renders['faces'])
         renders = {k: [v[i] for i in range(be, en) if len(v)] for k, v in renders.items()}
 
-        print('Computing face2label for each view on ', mp.cpu_count(), ' cores')
         label_sequence_count = 1 # background is 0
         args = []
         for faceid, cmask, norms, pose in zip(
@@ -395,9 +413,13 @@ class SamModelMesh(nn.Module):
             label_sequence_count += len(labels)
         
         with mp.Pool(mp.cpu_count()) as pool:
-            face2label_views = pool.starmap(compute_face2label, args)
+            face2label_views = list(tqdm(
+                pool.starmap(compute_face2label, args) if len(args) <= 1 else 
+                pool.imap(_compute_face2label_wrapper, args),
+                total=len(args),
+                desc=f'Computing face2label ({mp.cpu_count()} cores)'
+            ))
         
-        print('Building match graph on ', mp.cpu_count(), ' cores')
         args = []
         for i, face2label1 in enumerate(face2label_views):
             for j, face2label2 in enumerate(face2label_views):
@@ -405,7 +427,12 @@ class SamModelMesh(nn.Module):
                     args.append((i, j, face2label1, face2label2, self.config.sam_mesh.get('connections_threshold', 32)))
         
         with mp.Pool(mp.cpu_count()) as pool:
-            partial_connections = pool.starmap(compute_connections, args)
+            partial_connections = list(tqdm(
+                pool.starmap(compute_connections, args) if len(args) <= 1 else
+                pool.imap_unordered(_compute_connections_wrapper, args),
+                total=len(args),
+                desc=f'Building match graph ({mp.cpu_count()} cores)'
+            ))
 
         connections_ratios = defaultdict(Counter)
         for c in partial_connections:
@@ -531,10 +558,10 @@ class SamModelMesh(nn.Module):
             for face in components[i]:
                 face2label_consistent.pop(face)
         
-        # fill islands
-        print('Smoothing labels')
+
         smooth_iterations = self.config.sam_mesh.smoothing_iterations
-        for iteration in range(smooth_iterations):
+        print('Smoothing labels')
+        for iteration in tqdm(range(smooth_iterations), desc='Smoothing labels'):
             count = 0
             changes = {}
             for face in range(len(self.renderer.tmesh.faces)):
@@ -651,8 +678,14 @@ class SamModelMesh(nn.Module):
         for face in range(len(self.renderer.tmesh.faces)):
             if face not in face2label_consistent:
                 face2label_consistent[face] = 0
-        face2label_consistent = self.split (face2label_consistent) # needed to label all faces for repartition
-        face2label_consistent = self.smooth_repartition_faces(face2label_consistent, target_labels=target_labels)
+        if not self.config.sam_mesh.get('skip_split', False):
+            face2label_consistent = self.split(face2label_consistent) # needed to label all faces for repartition
+        else:
+            print('Skipping split (sam_mesh.skip_split=True)')
+        if not self.config.sam_mesh.get('skip_repartition', False):
+            face2label_consistent = self.smooth_repartition_faces(face2label_consistent, target_labels=target_labels)
+        else:
+            print('Skipping repartition (sam_mesh.skip_repartition=True)')
         face2label_consistent = {int(k): int(v) for k, v in face2label_consistent.items()} # ensure serialization
         assert self.renderer.tmesh.faces.shape[0] == len(face2label_consistent)
         return face2label_consistent, self.renderer.tmesh
@@ -682,14 +715,32 @@ class SamModelMesh(nn.Module):
         return components
 
 
-def segment_mesh(filename: Path | str, config: OmegaConf, visualize=False, extension='glb', target_labels=None, texture=False) -> Trimesh:
+def segment_mesh(filename: Path | str, config: OmegaConf, visualize=False, extension='glb', target_labels=None, texture=False, output_name=None) -> Trimesh:
     """
+    Segment a mesh using SAMesh.
+    
+    Args:
+        filename: Path to input mesh file
+        config: OmegaConf configuration
+        visualize: Whether to save visualization renders
+        extension: Output file extension (default: 'glb')
+        target_labels: Target number of labels (optional)
+        texture: Whether to preserve texture (default: False)
+        output_name: Custom name for output files. If None, uses input filename stem.
+                     Example: output_name='mailbox' -> 'mailbox_segmented.glb'
+    
+    Returns:
+        Colored trimesh with segmentation
     """
     print('Segmenting mesh with SAMesh: ', filename)
     filename = Path(filename)
     config = copy.deepcopy(config)
-    config.cache  = Path(config.cache)  / filename.stem if "cache" in config else None
-    config.output = Path(config.output) / filename.stem 
+    
+    # Use custom output_name if provided, otherwise use input filename stem
+    name = output_name if output_name else filename.stem
+    
+    config.cache  = Path(config.cache)  / name if "cache" in config else None
+    config.output = Path(config.output) / name 
 
     model = SamModelMesh(config)
     tmesh = read_mesh(filename, norm=True)
@@ -697,7 +748,7 @@ def segment_mesh(filename: Path | str, config: OmegaConf, visualize=False, exten
         tmesh = remove_texture(tmesh, visual_kind='vertex')
     
     # run sam grounded mesh and optionally visualize renders
-    visualize_path = f'{config.output}/{filename.stem}_visualized' if visualize else None
+    visualize_path = f'{config.output}/{name}_visualized' if visualize else None
     faces2label, _ = model(tmesh, visualize_path=visualize_path, target_labels=target_labels)
     # Multiple faces can have the same label, so we need to split the mesh into parts
     labels = set(faces2label.values())
@@ -706,12 +757,12 @@ def segment_mesh(filename: Path | str, config: OmegaConf, visualize=False, exten
         tmp_mesh = tmesh.copy()
         tmp_mesh.update_faces(faces)
         tmp_mesh.remove_unreferenced_vertices()
-        tmp_mesh.export(f'{config.output}/{filename.stem}_part_{label}.glb')
+        tmp_mesh.export(f'{config.output}/{name}_part_{label}.glb')
 
     # colormap and save mesh
     os.makedirs(config.output, exist_ok=True)
     tmesh_colored = colormap_faces_mesh(tmesh, faces2label)
-    tmesh_colored.export(f'{config.output}/{filename.stem}_segmented.{extension}')
+    tmesh_colored.export(f'{config.output}/{name}_segmented.{extension}')
     json.dump(faces2label, open(f'{config.output}/face2label.json', 'w'))
     return tmesh_colored
 
