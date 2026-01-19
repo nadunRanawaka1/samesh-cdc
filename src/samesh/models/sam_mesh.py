@@ -188,6 +188,9 @@ def visualize_items(items: dict, path: Path) -> None:
     if 'sdf' in items:
         for i, image in tqdm(enumerate(items['sdf']), 'Visualizing SDF'):
             image.save(f'{path}/sdf_{i}.png')
+    if 'rgb' in items:
+        for i, image in tqdm(enumerate(items['rgb']), 'Visualizing RGB'):
+            image.save(f'{path}/rgb_{i}.png')
     
     for i, faces in tqdm(enumerate(items['faces']), 'Visualizing FaceIDs'):
         colormap_faces(faces).save(f'{path}/faces_{i}.png')
@@ -355,54 +358,66 @@ class SamModelMesh(nn.Module):
         mode_weights = self.config.sam_mesh.get('mode_weights', {})
         default_weight = 1
 
-        if 'norms' in self.config.sam_mesh.use_modes:
-            images1 = [colormap_norms(norms) for norms in renders['norms']]
-            bmasks1 = [
+        # Process modes that use the ORIGINAL scene first, then SDF last (which modifies it)
+        
+        if 'matte' in self.config.sam_mesh.use_modes: # default matte render (shaded grayscale)
+            images_matte = renders['matte']
+            bmasks_matte = [
                 call_sam(image, faces != -1) for image, faces in \
-                    tqdm(zip(images1, renders['faces']), 'Computing SAM Masks for norms')
+                    tqdm(zip(images_matte, renders['faces']), 'Computing SAM Masks for matte')
             ]
-            # Store original masks for visualization
-            mode_bmasks['norms'] = bmasks1
-            # Apply weight by repeating masks (weight of 2 = masks count twice)
+            mode_bmasks['matte'] = bmasks_matte
+            weight = int(mode_weights.get('matte', default_weight))
+            for _ in range(weight):
+                bmasks_list.extend(bmasks_matte)
+            mode_order.append('matte')
+
+        if 'rgb' in self.config.sam_mesh.use_modes: # true color render with original textures
+            # Render with uv_map=True to get original colors/textures
+            renders_rgb = render_func(uv_map=True)
+            images_rgb = renders_rgb['matte']  # 'matte' key contains RGB when uv_map=True
+            
+            bmasks_rgb = [
+                call_sam(image, faces != -1) for image, faces in \
+                    tqdm(zip(images_rgb, renders['faces']), 'Computing SAM Masks for rgb')
+            ]
+            mode_bmasks['rgb'] = bmasks_rgb
+            weight = int(mode_weights.get('rgb', default_weight))
+            for _ in range(weight):
+                bmasks_list.extend(bmasks_rgb)
+            renders['rgb'] = images_rgb
+            mode_order.append('rgb')
+
+        if 'norms' in self.config.sam_mesh.use_modes:
+            images_norms = [colormap_norms(norms) for norms in renders['norms']]
+            bmasks_norms = [
+                call_sam(image, faces != -1) for image, faces in \
+                    tqdm(zip(images_norms, renders['faces']), 'Computing SAM Masks for norms')
+            ]
+            mode_bmasks['norms'] = bmasks_norms
             weight = int(mode_weights.get('norms', default_weight))
             for _ in range(weight):
-                bmasks_list.extend(bmasks1)
+                bmasks_list.extend(bmasks_norms)
             mode_order.append('norms')
 
+        # SDF must be LAST - it modifies the scene by loading a colorized mesh
         if 'sdf' in self.config.sam_mesh.use_modes:
-            #scene_sdf = remove_texture(scene)
             tmesh_sdf = prep_mesh_shape_diameter_function(scene)
             tmesh_sdf = colormap_shape_diameter_function(tmesh_sdf, sdf_values=shape_diameter_function(tmesh_sdf))
             self.load(tmesh_sdf)
             renders_sdf = render_func(uv_map=True)
-            images2 = renders_sdf['matte']
+            images_sdf = renders_sdf['matte']
 
-            bmasks2 = [
+            bmasks_sdf = [
                 call_sam(image, faces != -1) for image, faces in \
-                    tqdm(zip(images2, renders['faces']), 'Computing SAM Masks for sdf')
+                    tqdm(zip(images_sdf, renders['faces']), 'Computing SAM Masks for sdf')
             ]
-            # Store original masks for visualization
-            mode_bmasks['sdf'] = bmasks2
-            # Apply weight by repeating masks
+            mode_bmasks['sdf'] = bmasks_sdf
             weight = int(mode_weights.get('sdf', default_weight))
             for _ in range(weight):
-                bmasks_list.extend(bmasks2)
-            renders['sdf'] = renders_sdf['matte']
+                bmasks_list.extend(bmasks_sdf)
+            renders['sdf'] = images_sdf
             mode_order.append('sdf')
-
-        if 'matte' in self.config.sam_mesh.use_modes: # default matte render
-            images3 = renders['matte']
-            bmasks3 = [
-                call_sam(image, faces != -1) for image, faces in \
-                    tqdm(zip(images3, renders['faces']), 'Computing SAM Masks for matte')
-            ]
-            # Store original masks for visualization
-            mode_bmasks['matte'] = bmasks3
-            # Apply weight by repeating masks
-            weight = int(mode_weights.get('matte', default_weight))
-            for _ in range(weight):
-                bmasks_list.extend(bmasks3)
-            mode_order.append('matte')
         
         # Store mode info and per-mode masks
         renders['mode_order'] = mode_order
@@ -445,7 +460,13 @@ class SamModelMesh(nn.Module):
         """
         """
         be, en = 0, len(renders['faces'])
-        renders = {k: [v[i] for i in range(be, en) if len(v)] for k, v in renders.items()}
+        # Only slice the core render lists needed for lifting
+        # Skip visualization-only lists (rgb, sdf) and metadata (mode_bmasks, mode_order, mode_weights)
+        core_keys = {'faces', 'cmasks', 'norms', 'poses', 'norms_masked', 'matte'}
+        renders = {
+            k: ([v[i] for i in range(be, en) if len(v)] if k in core_keys and isinstance(v, list) else v)
+            for k, v in renders.items()
+        }
 
         label_sequence_count = 1 # background is 0
         args = []
