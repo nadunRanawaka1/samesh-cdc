@@ -193,6 +193,18 @@ def visualize_items(items: dict, path: Path) -> None:
         colormap_faces(faces).save(f'{path}/faces_{i}.png')
     for i, cmask in tqdm(enumerate(items['cmasks']), 'Visualizing SAM Masks'):
         colormap_mask (cmask).save(f'{path}/masks_{i}.png')
+    
+    # Visualize per-mode masks if available
+    if 'mode_bmasks' in items:
+        for mode_name, mode_masks in items['mode_bmasks'].items():
+            mode_dir = f'{path}/{mode_name}_masks'
+            os.makedirs(mode_dir, exist_ok=True)
+            for i, bmask_array in tqdm(enumerate(mode_masks), f'Visualizing {mode_name} masks'):
+                # bmask_array is a numpy array of binary masks, combine them for visualization
+                if len(bmask_array) > 0:
+                    combined = combine_bmasks(bmask_array, sort=True)
+                    colormap_mask(combined).save(f'{mode_dir}/mask_{i}.png')
+    
     for i, norms in tqdm(enumerate(items['norms']), 'Visualizing Normals'):
         colormap_norms(norms).save(f'{path}/norms_{i}.png')
     for i, norms_masked in tqdm(enumerate(items['norms_masked']), 'Visualizing Normals Mask'):
@@ -335,6 +347,13 @@ class SamModelMesh(nn.Module):
             return self.sam(image)
 
         bmasks_list = []
+        mode_order = []  # Track which modes were used, in order
+        mode_bmasks = {}  # Store per-mode masks for visualization
+        
+        # Get mode weights from config (default to 1.0 for all)
+        # Weights are integers that control how many times each mode's masks are counted
+        mode_weights = self.config.sam_mesh.get('mode_weights', {})
+        default_weight = 1
 
         if 'norms' in self.config.sam_mesh.use_modes:
             images1 = [colormap_norms(norms) for norms in renders['norms']]
@@ -342,7 +361,13 @@ class SamModelMesh(nn.Module):
                 call_sam(image, faces != -1) for image, faces in \
                     tqdm(zip(images1, renders['faces']), 'Computing SAM Masks for norms')
             ]
-            bmasks_list.extend(bmasks1)
+            # Store original masks for visualization
+            mode_bmasks['norms'] = bmasks1
+            # Apply weight by repeating masks (weight of 2 = masks count twice)
+            weight = int(mode_weights.get('norms', default_weight))
+            for _ in range(weight):
+                bmasks_list.extend(bmasks1)
+            mode_order.append('norms')
 
         if 'sdf' in self.config.sam_mesh.use_modes:
             #scene_sdf = remove_texture(scene)
@@ -356,8 +381,14 @@ class SamModelMesh(nn.Module):
                 call_sam(image, faces != -1) for image, faces in \
                     tqdm(zip(images2, renders['faces']), 'Computing SAM Masks for sdf')
             ]
-            bmasks_list.extend(bmasks2)
+            # Store original masks for visualization
+            mode_bmasks['sdf'] = bmasks2
+            # Apply weight by repeating masks
+            weight = int(mode_weights.get('sdf', default_weight))
+            for _ in range(weight):
+                bmasks_list.extend(bmasks2)
             renders['sdf'] = renders_sdf['matte']
+            mode_order.append('sdf')
 
         if 'matte' in self.config.sam_mesh.use_modes: # default matte render
             images3 = renders['matte']
@@ -365,7 +396,19 @@ class SamModelMesh(nn.Module):
                 call_sam(image, faces != -1) for image, faces in \
                     tqdm(zip(images3, renders['faces']), 'Computing SAM Masks for matte')
             ]
-            bmasks_list.extend(bmasks3)
+            # Store original masks for visualization
+            mode_bmasks['matte'] = bmasks3
+            # Apply weight by repeating masks
+            weight = int(mode_weights.get('matte', default_weight))
+            for _ in range(weight):
+                bmasks_list.extend(bmasks3)
+            mode_order.append('matte')
+        
+        # Store mode info and per-mode masks
+        renders['mode_order'] = mode_order
+        renders['mode_weights'] = {mode: int(mode_weights.get(mode, default_weight)) for mode in mode_order}
+        renders['mode_bmasks'] = mode_bmasks  # Per-mode masks for visualization
+        print(f"Mode weights (masks repeated N times): {renders['mode_weights']}")
 
         self.load(scene) # restore original scene
 
@@ -385,6 +428,11 @@ class SamModelMesh(nn.Module):
         cmasks = [remove_artifacts(mask, mode='holes'  , min_area=min_area) for mask in cmasks]
         renders['bmasks'] = bmasks
         renders['cmasks'] = cmasks
+        
+        # Track which mode each set of n views came from (for weighted face2label)
+        # bmasks_list layout: [norms_view0, norms_view1, ..., sdf_view0, sdf_view1, ..., matte_view0, ...]
+        # Each mode contributes n masks (one per view)
+        renders['mode_per_view_batch'] = mode_order  # Each mode has n consecutive masks in bmasks_list
 
         if self.config.cache is not None:
             self.config.cache.mkdir(parents=True)
