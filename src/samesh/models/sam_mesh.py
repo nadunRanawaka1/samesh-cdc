@@ -574,10 +574,76 @@ class SamModelMesh(nn.Module):
     
         connection_graph = igraph.Graph(edges=connections, directed=False)
         connection_graph.simplify()
-        communities = connection_graph.community_leiden(resolution_parameter=0)
-        # for comm in communities:
-        #     print(comm)
-        # exit()
+        
+        # Community detection algorithm selection
+        community_algorithm = self.config.sam_mesh.get('community_algorithm', 'leiden')
+        leiden_resolution = self.config.sam_mesh.get('leiden_resolution', 0.0)
+        multi_community = self.config.sam_mesh.get('multi_community', False)
+        
+        print(f"  Graph: {connection_graph.vcount()} nodes, {connection_graph.ecount()} edges")
+        
+        # Debug mode: run all algorithms and compare
+        if multi_community:
+            print("\n" + "="*60)
+            print("MULTI-COMMUNITY DEBUG: Comparing all algorithms")
+            print("="*60)
+            
+            algorithms = [
+                ('leiden (res=0.0)', lambda g: g.community_leiden(resolution_parameter=0.0)),
+                ('leiden (res=0.5)', lambda g: g.community_leiden(resolution_parameter=0.5)),
+                ('leiden (res=1.0)', lambda g: g.community_leiden(resolution_parameter=1.0)),
+                ('leiden (res=2.0)', lambda g: g.community_leiden(resolution_parameter=2.0)),
+                ('louvain', lambda g: g.community_multilevel()),
+                ('label_propagation', lambda g: g.community_label_propagation()),
+                ('infomap', lambda g: g.community_infomap()),
+                ('walktrap', lambda g: g.community_walktrap().as_clustering()),
+            ]
+            
+            print(f"\n{'Algorithm':<25} {'Communities':>12} {'Sizes (top 5)':<30}")
+            print("-" * 70)
+            
+            for name, algo_fn in algorithms:
+                try:
+                    result = algo_fn(connection_graph)
+                    n_comm = len(result)
+                    sizes = sorted([len(c) for c in result], reverse=True)[:5]
+                    print(f"{name:<25} {n_comm:>12} {str(sizes):<30}")
+                except Exception as e:
+                    print(f"{name:<25} {'ERROR':>12} {str(e)[:30]}")
+            
+            print("-" * 70)
+            print(f"Using: {community_algorithm} (resolution={leiden_resolution})")
+            print("="*60 + "\n")
+        
+        # Run the selected algorithm
+        if community_algorithm == 'leiden':
+            # Leiden: resolution=0 gives fewer/larger communities, higher gives more/smaller
+            communities = connection_graph.community_leiden(resolution_parameter=leiden_resolution)
+        elif community_algorithm == 'louvain':
+            # Louvain: classic modularity-based community detection
+            communities = connection_graph.community_multilevel()
+        elif community_algorithm == 'label_propagation':
+            # Label propagation: fast, good for clear community structure
+            communities = connection_graph.community_label_propagation()
+        elif community_algorithm == 'infomap':
+            # Infomap: based on information flow, good for hierarchical structure
+            communities = connection_graph.community_infomap()
+        elif community_algorithm == 'walktrap':
+            # Walktrap: random walks, good for detecting overlapping communities
+            communities = connection_graph.community_walktrap().as_clustering()
+        else:
+            print(f"Unknown community algorithm '{community_algorithm}', using leiden")
+            communities = connection_graph.community_leiden(resolution_parameter=leiden_resolution)
+        
+        print(f"Community detection: {community_algorithm} (resolution={leiden_resolution})")
+        print(f"  Found {len(communities)} communities")
+        
+        # Debug: show community sizes
+        comm_sizes = sorted([len(c) for c in communities], reverse=True)
+        if len(comm_sizes) > 10:
+            print(f"  Sizes (top 10): {comm_sizes[:10]}...")
+        else:
+            print(f"  Sizes: {comm_sizes}")
         label2label_consistent = {}
         comm_count = 0
         for comm in communities:
