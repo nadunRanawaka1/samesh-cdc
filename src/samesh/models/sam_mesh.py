@@ -815,6 +815,7 @@ class SamModelMesh(nn.Module):
                 face2label_consistent[face] = 0
         if not self.config.sam_mesh.get('skip_split', False):
             face2label_consistent = self.split(face2label_consistent) # needed to label all faces for repartition
+            
         else:
             print('Skipping split (sam_mesh.skip_split=True)')
         if not self.config.sam_mesh.get('skip_repartition', False):
